@@ -80,7 +80,7 @@ pipeline {
             steps {
                 script {
                     try {
-                        sh "docker image build --force-rm --build-arg custom_params=--production -t ${DOCKER_IMAGE} ./app"
+                        sh "docker image build --force-rm --build-arg custom_params=--production -t ${DOCKER_IMAGE} ."
                         withDockerRegistry([credentialsId: 'DockerHub']) {
                             sh "docker push ${DOCKER_IMAGE}"
                         }
