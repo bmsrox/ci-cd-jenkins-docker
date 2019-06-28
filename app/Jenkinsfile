@@ -199,7 +199,7 @@ def deployAsContainer() {
     try {
         checkout scm
         sh "docker container rm -f ${APP_NAME} || true"
-        sh "docker image build --force-rm -t ${DOCKER_IMAGE} ./app"
+        sh "docker image build --force-rm -t ${DOCKER_IMAGE} ."
         sh "docker container run --network bitlan -d -p ${BIND_PORT} --name ${APP_NAME} ${DOCKER_IMAGE}"
         restartProxy()
     } catch (e) {
