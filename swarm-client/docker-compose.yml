@@ -1,0 +1,38 @@
+version: '3.2'
+
+services:
+  jenkins-agent:
+      image: <your registry here>/jenkins-swarm-agent:latest
+      deploy:
+        mode: global
+        restart_policy:
+          condition: on-failure
+      secrets:
+        - source: jenkins-master
+          target: jenkins
+      environment:
+        LABELS: staging
+      volumes:
+        - /root/.ssh:/root/.ssh
+        - /tmp:/tmp
+        - /var/run/docker.sock:/var/run/docker.sock
+        - /var/lib/docker/volumes:/tmp/volumes
+  proxy:
+    image: <your registry here>/proxy:latest
+    deploy:
+      mode: global
+      restart_policy:
+        condition: on-failure
+    ports:
+        - 80:80
+    volumes:
+        - proxy-nginx:/etc/nginx/conf.d
+secrets:
+   jenkins-master:
+      external: true
+volumes:
+    proxy-nginx:
+networks:
+  default:
+    external:
+      name: bitlan

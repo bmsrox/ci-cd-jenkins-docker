@@ -1,0 +1,316 @@
+def serverNames = [
+    production: '<name of your prod server here>',
+    staging: '<name your stag server here>',
+]
+
+pipeline {
+    agent {
+        label 'master'
+    }
+    options {
+        skipDefaultCheckout()
+    }
+    environment {
+        APP_NAME = '<your app name here>'
+        SERVER_ENV = "${getEnvironment().toLowerCase()}"
+        SERVERNAME = "${serverNames[SERVER_ENV]}"
+        BUILD_NUMBER = "${env.BUILD_NUMBER}"
+        REGISTRY_REPO = "<your registry here>/${APP_NAME}"
+        DOCKER_IMAGE = "${REGISTRY_REPO}:${BUILD_NUMBER}"
+        BIND_PORT = "3000:3000"
+        PROXY_SERVICE_NAME = "${SERVERNAME}-swarm-client_proxy-nginx"
+        PROXY_VOLUMES_PATH = "/tmp/volumes/${PROXY_SERVICE_NAME}/_data"
+        PROXY_FILE_CONF = "proxy_reverse.conf"
+    }
+    parameters {
+        string(name: 'REQUESTER_MAIL', defaultValue: '', description: 'Stakeholders emails')
+        string(name: 'DEVS_MAIL', defaultValue: 'web@example.com', description: 'Dev Team emails')
+        booleanParam(defaultValue: false, name: 'ROLLBACK_PREVIOUS_VERSION', description: 'Rollback Applications to the previous version?')
+        string(name: 'VERSION', defaultValue: '', description: 'Version to Rollback')
+        string(name: 'SERVERNAME', defaultValue: "${SERVERNAME}" , description: 'Nome do servidor')
+    }
+    stages {
+        stage('Build') {
+            when {
+                expression {
+                    return !params.ROLLBACK_PREVIOUS_VERSION  
+                }
+            }
+            steps {
+                checkout scm
+                script {
+                    try {
+                        PROXY_STRING = readFile("${PROXY_FILE_CONF}")
+                        sh "docker image build --force-rm -t ${DOCKER_IMAGE} ."
+                    } catch(e) {
+                        error "Build failed!"
+                    }
+                }
+            }
+        }
+        stage('Test') {
+            when {
+                expression {
+                    return !params.ROLLBACK_PREVIOUS_VERSION  
+                }
+            }
+            steps {
+                script {
+                    try {
+                        sh "docker container run -d -p ${BIND_PORT} --name ${APP_NAME} ${DOCKER_IMAGE}"
+                        sh "docker exec ${APP_NAME} npm test"
+                    } catch(e) {
+                        error "Test failed!"
+                    }finally {
+                        sh "docker container rm -f ${APP_NAME} || true"
+                        sh "docker image rm -f ${DOCKER_IMAGE} || true"
+                    }
+                }
+            }
+        }
+        stage('Publish Image') {
+            when {
+                allOf {
+                    branch 'master'
+                    expression {
+                        return !params.ROLLBACK_PREVIOUS_VERSION
+                    }
+                }
+            }
+            steps {
+                script {
+                    try {
+                        sh "docker image build --force-rm --build-arg custom_params=--production -t ${DOCKER_IMAGE} ./app"
+                        withDockerRegistry([credentialsId: 'DockerHub']) {
+                            sh "docker push ${DOCKER_IMAGE}"
+                        }
+                    } catch(e) {
+                        error "Publish failed!"
+                    }finally {
+                        sh "docker image rm -f ${DOCKER_IMAGE} || true"
+                    }
+                }
+            }
+        }
+        stage('Deploy') {
+            agent {
+                node {
+                    label "${params.SERVERNAME}"
+                }
+            }
+            when {
+                beforeAgent true
+                expression {
+                    return !params.ROLLBACK_PREVIOUS_VERSION  
+                }
+            }
+            steps {
+                script {
+                    deploy()
+                    deleteDir()
+                }
+            }
+        }
+        stage('Rollback') {
+            agent {
+                node {
+                    label "${params.SERVERNAME}"
+                }
+            }
+            when {
+                beforeAgent true
+                expression {
+                    return params.ROLLBACK_PREVIOUS_VERSION && params.VERSION 
+                }
+            }
+            steps {
+                script {
+                    timeout(time: 1, unit: 'HOURS') {
+                        input "Are you sure to want rollback this application?"
+                        rollback()    
+                    }
+                }
+            }
+        }
+    }
+    post {
+       success {
+            script {
+                if (params.ROLLBACK_PREVIOUS_VERSION) {
+                    notifyRollbackSuccess()
+                } else {
+                    notifySuccess()
+                }
+                keepReleases()
+            }
+        }
+        failure {
+            script {
+                if (params.ROLLBACK_PREVIOUS_VERSION) {
+                    notifyRollbackFailure()
+                } else {
+                    notifyFailure()
+                }
+            }
+        }
+    }
+}
+
+def deploy() {
+    switch("${SERVER_ENV}") {
+        case "Production":
+            deployAsService()
+            break
+        default:
+            deployAsContainer()
+            break
+    }
+}
+
+def rollback() {
+    switch("${SERVER_ENV}") {
+        case "Production":
+            rollbackService()
+            break
+        default:
+            rollbackContainer()
+            break
+    }
+}
+
+def deployAsService() {
+    try {
+        sh '''
+          SERVICES=$(docker service ls --filter name=${APP_NAME} --quiet | wc -l)
+          if [[ "$SERVICES" -eq 0 ]]; then
+            docker service create --replicas 1 --network bitlan --name ${APP_NAME} -p ${BIND_PORT} ${DOCKER_IMAGE}
+          else
+            docker service update --image ${DOCKER_IMAGE} ${APP_NAME}
+          fi
+          '''
+        restartProxy()
+    }catch (e) {
+        sh "docker service update --rollback ${APP_NAME}"
+        error "Service update failed in production!"
+    }
+}
+
+def deployAsContainer() {
+    try {
+        checkout scm
+        sh "docker container rm -f ${APP_NAME} || true"
+        sh "docker image build --force-rm -t ${DOCKER_IMAGE} ./app"
+        sh "docker container run --network bitlan -d -p ${BIND_PORT} --name ${APP_NAME} ${DOCKER_IMAGE}"
+        restartProxy()
+    } catch (e) {
+        error "Deploy failed!"
+    }
+}
+
+//keep the latest 3 images
+def keepReleases() {
+    try {
+        def img_list = "\$(docker image ls -f reference=${REGISTRY_REPO}:* -q | tail -n +4)"
+        sh "docker image rmi -f " + img_list
+    } catch (e) {
+        echo "Does not possible to remove oldest images."
+    }
+}
+
+def restartProxy() {
+    sh "echo '${PROXY_STRING}' > ${PROXY_VOLUMES_PATH}/${APP_NAME}.conf"
+    sh 'docker exec $(docker ps -a | grep proxy | awk \'{print $1}\') sh -c "nginx -s reload"'
+}
+
+def rollbackService() {
+    try {
+        sh '''
+            HAS_IMAGE=$(docker image ls -f reference=${REGISTRY_REPO}:${VERSION} --quiet | wc -l)
+            if [["$HAS_IMAGE" -eq 0]]; then
+              echo "Image does not exist."
+            else
+              docker service update --image ${REGISTRY_REPO}:${VERSION} ${APP_NAME}
+            fi
+            '''
+    } catch (e) {
+        error "Does not possible rollback this application!"
+    }
+}
+
+def rollbackContainer() {
+    try {
+        sh '''
+            HAS_IMAGE=$(docker image ls -f reference=${REGISTRY_REPO}:${VERSION} --quiet | wc -l)
+            if [["$HAS_IMAGE" -eq 0]]; then
+              echo "Image does not exist."
+            else
+              docker container rm -f ${APP_NAME} || true
+              docker container run --network bitlan -d -p ${BIND_PORT} --name ${APP_NAME} ${REGISTRY_REPO}:${VERSION}
+            fi
+            '''
+    } catch (e) {
+        error "Does not possible rollback this application"
+    }
+}
+
+def notifyRollbackSuccess() {
+    sendMail(
+        params.REQUESTER_MAIL, 
+        params.DEVS_MAIL, 
+        "SUCCESS ROLLBACK: Job '${env.JOB_NAME}' [${BUILD_NUMBER}]",
+        "The software was rollbacked to the previous version in '${SERVER_ENV}'"
+    )
+}
+
+def notifyRollbackFailure () {
+    sendMail(
+        params.DEVS_MAIL, 
+        null, 
+        "ROLLBACK FAILURE: Job '${env.JOB_NAME}' [${BUILD_NUMBER}]",
+        "Does not possible rollback this application. Please check it. ${env.BUILD_URL}"
+    ) 
+}
+
+def notifySuccess() {
+    sendMail(
+        params.REQUESTER_MAIL, 
+        params.DEVS_MAIL, 
+        "SUCCESS: Job '${env.JOB_NAME}' [${BUILD_NUMBER}]",
+        "A new software version has been released in '${SERVER_ENV}'"
+    )
+}
+
+def notifyFailure (rollback) { 
+    sendMail(
+        params.DEVS_MAIL, 
+        null, 
+        "FAILURE: Job '${env.JOB_NAME}' [${BUILD_NUMBER}]",
+        "Something went wrong on project build! Please check it. ${env.BUILD_URL}"
+    ) 
+}
+
+def sendMail(to, cc, subject, message) {
+    try {
+        mail (
+            to: to,
+            cc: cc,
+            subject: subject,
+            mimeType: 'text/html',
+            body: message
+        )
+
+        echo "Email successfully sent!"
+    } catch(e) {
+        echo "Failed to send email!"
+    }
+}
+
+def getEnvironment() {
+  def branch = "${env.BRANCH_NAME}"
+  
+  if (branch == "master") {
+    branch = "production"
+  } 
+  
+  return branch.capitalize()
+}
